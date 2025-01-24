@@ -3,10 +3,11 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators as OP;
+use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
+use serde::de;
 use std::path::Path;
 pub struct Llama<T> {
     vocab: usize,           // vocab size
@@ -141,6 +142,7 @@ impl Llama<f32> {
     }
 }
 
+
 fn self_attention(
     hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
     att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
@@ -167,7 +169,30 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    todo!("Implement mlp");
+    // 对 residual 进行 RMS 归一化，结果存储在 hidden_states 中
+    rms_norm(hidden_states, residual, rms_w, eps);
+
+    // 进行矩阵乘法
+    matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
+    matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
+
+    // 计算 SwiGLU 激活函数
+    swiglu(up, gate);
+    
+
+    // 进行矩阵乘法
+    matmul_transb(hidden_states, 0.0, up, w_down, 1.0);
+
+    // 残差连接
+    unsafe {
+        residual.data_mut().iter_mut()
+        .zip(hidden_states.data().iter())
+        .for_each(|(r, h)| *r += *h);
+    }
+    // residual.print();
+    // act = gate * sigmoid(gate) * up ## SwiGLU
+    // output = act @ down_weight.T
+    // residual = output + residual
 }
 
 #[test]
