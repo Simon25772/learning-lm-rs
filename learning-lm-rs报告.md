@@ -16,7 +16,21 @@
 
 思路: 使用actixweb框架，在APP层面缓存KVCache，使用session技术识别用户。
 
-三，有待提高
+三，功能展示
+
+1.故事续写
+
+![img](https://pic1.imgdb.cn/item/67b065b0d0e0a243d4ff9eea.png)
+
+2.AI对话
+
+![img](https://pic1.imgdb.cn/item/67b06603d0e0a243d4ff9f1c.png)
+
+3.网络服务API
+
+![img](https://pic1.imgdb.cn/item/67b06615d0e0a243d4ff9f24.png)
+
+四，有待提高
 
 1.混合精度不支持TF32
 
