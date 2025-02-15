@@ -20,15 +20,15 @@
 
 1.故事续写
 
-![img](https://pic1.imgdb.cn/item/67b065b0d0e0a243d4ff9eea.png)
+![img](story_show.png)
 
 2.AI对话
 
-![img](https://pic1.imgdb.cn/item/67b06603d0e0a243d4ff9f1c.png)
+![img](chat_show.png)
 
 3.网络服务API
 
-![img](https://pic1.imgdb.cn/item/67b06615d0e0a243d4ff9f24.png)
+![img](webapi_show.png)
 
 四，有待提高
 
