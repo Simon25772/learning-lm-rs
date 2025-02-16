@@ -361,14 +361,5 @@ fn start(){
 }
 
 fn main() {
-    // 记录开始时间
-    let _start = Instant::now();
-
     start();
-
-    // 记录结束时间并计算耗时
-    let duration = _start.elapsed();
-
-    // 打印运行时间
-    println!("total time:{:?}", duration);
 }
