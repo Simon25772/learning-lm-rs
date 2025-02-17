@@ -62,6 +62,41 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         }
     }
 
+    pub fn divide_by_row(&self, n: usize) -> Vec<Tensor<T>> {
+        let (row, col) = (self.shape()[0], self.shape()[1]);
+        assert!(row % n == 0, "Row count must be divisible by n");
+    
+        let mut result = Vec::new();
+        for i in 0..n {
+            result.push(self.slice(i * (row / n) * col, &vec![row / n, col]));
+        }
+        result
+    }
+
+    pub fn divide_by_col(&self, n: usize) -> Vec<Tensor<T>> {
+        let (row, col) = (self.shape()[0], self.shape()[1]);
+        assert!(col % n == 0, "Column count must be divisible by n");
+    
+        // 创建一个临时的 vector 来保存分割的列数据
+        let mut tmp_vec: Vec<Vec<T>> = vec![Vec::new(); n];
+        let data = self.data();
+        let w = col / n;
+    
+        // 将数据分配到临时的列 vector 中
+        for i in 0..row {
+            for j in 0..col {
+                tmp_vec[j / w].push(data[i * col + j]);
+            }
+        }
+    
+        // 创建结果中的每个 Tensor
+        let mut result = Vec::new();
+        for i in 0..n {
+            result.push(Tensor::new(tmp_vec[i].clone(), &vec![row, col / n]));
+        }
+        result
+    }
+
 
 }
 
