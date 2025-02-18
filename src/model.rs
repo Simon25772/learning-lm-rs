@@ -107,21 +107,20 @@ where
 
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
-            self_attention(
-                &mut hidden_states,              // 存储注意力机制的输出张量
-                &mut att_scores,      // 存储注意力得分的张量
-                q,                   // Query 张量，表示查询向量
-                &full_k,             // Key 张量，表示键向量
-                &full_v,             // Value 张量，表示值向量
-                self.n_kv_h,         // Key 和 Value 的头数量
-                n_groups,            // 注意力头的分组数量
-                seq_len,             // 输入序列的长度
-                total_seq_len,       // 总序列长度（包括当前序列和缓存的过往序列）
-                self.dqkv,           // 单个 Query、Key 或 Value 向量的维度
-            );
-
-            matmul_transb(&mut residual, T::one(), &hidden_states, &self.params.wo[layer], T::one());
-
+            // self_attention(
+            //     &mut hidden_states,              // 存储注意力机制的输出张量
+            //     &mut att_scores,      // 存储注意力得分的张量
+            //     q,                   // Query 张量，表示查询向量
+            //     &full_k,             // Key 张量，表示键向量
+            //     &full_v,             // Value 张量，表示值向量
+            //     self.n_kv_h,         // Key 和 Value 的头数量
+            //     n_groups,            // 注意力头的分组数量
+            //     seq_len,             // 输入序列的长度
+            //     total_seq_len,       // 总序列长度（包括当前序列和缓存的过往序列）
+            //     self.dqkv,           // 单个 Query、Key 或 Value 向量的维度
+            // );
+            // matmul_transb(&mut residual, T::one(), &hidden_states, &self.params.wo[layer], T::one());
+            self_attention_parallel(&mut residual, &mut hidden_states, &mut att_scores, q, &full_k, &full_v, &self.params.wo[layer], self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
             mlp(
                 &mut residual,                                  // residual 被传入 MLP 层处理
                 &mut hidden_states,                             // 处理结果存储在 hidden_states 中
@@ -242,6 +241,139 @@ where
     }
 }
 
+fn self_attention_parallel<T>(
+    residual: &mut Tensor<T>,
+    hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)
+    att_scores: &mut Tensor<T>,    // (n_kv_h, n_groups, seq, total_seq)
+    q: &Tensor<T>,                 // (seq, n_kv_h * n_groups * dqkv)
+    k: &Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
+    v: &Tensor<T>,
+    o: &Tensor<T>,              // (total_seq, n_kv_h * dqkv)
+    n_kv_h: usize,
+    n_groups: usize,
+    seq_len: usize,
+    total_seq_len: usize,
+    dqkv: usize,
+) where T: 'static+Send+Sync+Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign + std::ops::DivAssign{
+    // 打印 Tensor 参数的形状
+    // println!("Shape of residual: {:?}", residual.shape());
+    // println!("Shape of hidden_states: {:?}", hidden_states.shape());
+    // println!("Shape of att_scores: {:?}", att_scores.shape());
+    // println!("Shape of q: {:?}:{:?}", q.shape(), q.len());
+    // println!("Shape of k: {:?}", k.shape());
+    // println!("Shape of v: {:?}", v.shape());
+    // println!("Shape of o: {:?}", o.shape());
+    let qs=Arc::new(q.divide_by_col(NUM_DEVICE));
+    let ks=Arc::new(k.divide_by_col(NUM_DEVICE));
+    let vs=Arc::new(v.divide_by_col(NUM_DEVICE));
+    let os=Arc::new(o.divide_by_col(NUM_DEVICE));
+    let residual_mutex=Arc::new(Mutex::new(residual.clone()));
+    let mut handles=Vec::new();
+    for i in 0..NUM_DEVICE{
+        let qs_clone=Arc::clone(&qs);
+        let ks_clone=Arc::clone(&ks);
+        let vs_clone=Arc::clone(&vs);
+        let os_clone=Arc::clone(&os);
+        let residual_clone=Arc::clone(&residual_mutex);
+        let handle=thread::spawn(move||{
+            self_attention_parallel_run(
+                residual_clone,
+                &mut Tensor::default(&vec![seq_len,n_kv_h/NUM_DEVICE*n_groups * dqkv]),
+                &mut Tensor::default(&vec![n_kv_h/NUM_DEVICE,n_groups,seq_len,total_seq_len]),
+                &qs_clone[i],
+                &ks_clone[i],
+                &vs_clone[i],
+                &os_clone[i],
+                n_kv_h/NUM_DEVICE,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                dqkv
+            );
+        });
+        handles.push(handle);
+    }
+    for handle in handles{
+        handle.join().unwrap();
+    }
+    let tmp=residual_mutex.lock().unwrap();
+    *residual=tmp.clone();
+}
+
+fn self_attention_parallel_run<T>(
+    residual: Arc<Mutex<Tensor<T>>>,
+    hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)
+    att_scores: &mut Tensor<T>,    // (n_kv_h, n_groups, seq, total_seq)
+    q: &Tensor<T>,                 // (seq, n_kv_h * n_groups * dqkv)
+    k: &Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
+    v: &Tensor<T>,
+    o:&Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
+    n_kv_h: usize,
+    n_groups: usize,
+    seq_len: usize,
+    total_seq_len: usize,
+    dqkv: usize
+)where T:'static+Send+Sync+Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign + std::ops::DivAssign{
+    // 获取各张量的数据指针
+    // 打印 Tensor 参数的形状
+    // println!("Shape of residual: {:?}", residual.lock().unwrap().shape());
+    // println!("Shape of hidden_states: {:?}", hidden_states.shape());
+    // println!("Shape of att_scores: {:?}", att_scores.shape());
+    // println!("Shape of q: {:?};{:?}", q.shape(), q.len());
+    // println!("Shape of k: {:?}", k.shape());
+    // println!("Shape of v: {:?}", v.shape());
+    // println!("Shape of o: {:?}", o.shape());
+   let att_scores_data = unsafe { att_scores.data_mut() };
+   let q_data = q.data();
+   let k_data = k.data();
+   let v_data = v.data();
+   // 计算归一化因子，即 dqkv 的平方根
+   let norm_factor = T::from(dqkv as f32).unwrap().sqrt();
+   // 第一步：计算注意力分数，公式为 score = Q @ K.T / sqrt(dim)
+   for head_group in 0..n_kv_h * n_groups {
+       for query_pos in 0..seq_len {
+           for key_pos in 0..total_seq_len {
+               // 初始化点积的累加和
+               let mut dot_prod = T::zero();
+               // 对 Query 和 Key 向量的每个维度进行点积计算
+               for dim in 0..dqkv {
+                   let q_index = query_pos * n_kv_h * n_groups * dqkv + head_group * dqkv + dim;
+                   let k_index = key_pos * n_kv_h * dqkv + (head_group / n_groups) * dqkv + dim;
+                   dot_prod += q_data[q_index] * k_data[k_index];
+               }
+               // 计算注意力分数的存储位置
+               let score_index = head_group * seq_len * total_seq_len + query_pos * total_seq_len + key_pos;
+               // 存储归一化后的点积结果
+               att_scores_data[score_index] = dot_prod / norm_factor;
+           }
+       }
+   }
+   // 第二步：对注意力分数应用 Softmax 函数，将其转换为概率分布
+   OP::masked_softmax(att_scores);
+   // 第三步：计算最终的隐藏状态，公式为 x = attn @ V
+   let att_scores = att_scores.data();
+   let hidden_states_data = unsafe { hidden_states.data_mut() };
+   for head_group in 0..n_kv_h * n_groups {
+       for query_pos in 0..seq_len {
+           for dim in 0..dqkv {
+               // 初始化加权和
+               let mut weighted_sum = T::zero();
+               // 对所有 Key 位置进行加权求和
+               for key_pos in 0..total_seq_len {
+                   let att_score_index = head_group * seq_len * total_seq_len + query_pos * total_seq_len + key_pos;
+                   let v_index = dim + (head_group / n_groups) * dqkv + key_pos * n_kv_h * dqkv;
+                   weighted_sum += att_scores[att_score_index] * v_data[v_index];
+               }
+               // 计算隐藏状态的存储位置
+               let hidden_index = query_pos * n_kv_h * n_groups * dqkv + head_group * dqkv + dim;
+               // 存储加权和结果
+               hidden_states_data[hidden_index] = weighted_sum;
+           }
+       }
+   }
+   let mut tmp=residual.lock().unwrap();
+   matmul_transb(&mut tmp, T::one(), &hidden_states, o, T::one());
+}
 
 fn self_attention<T>(
     hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)

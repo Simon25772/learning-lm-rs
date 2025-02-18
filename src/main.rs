@@ -14,7 +14,7 @@ use tokenizers::Tokenizer;
 use actix_web::{get, web::{self, Data}, App, HttpServer, Responder};
 use actix_session::Session;
 use actix_session::CookieSession;
-const NUM_DEVICE:usize=4;
+
 fn chat_start<T>()
 where T:'static+Send+Sync+ Float
 + std::ops::AddAssign
@@ -44,13 +44,14 @@ where T:'static+Send+Sync+ Float
         let input_ids = binding.get_ids();
         // println!("DEBUG!input_ids:{:?}", input_ids);
         println!("Assistant:");
+        let start_time = Instant::now();
         // 使用推荐参数do_sample
         // 推理太慢了，使用迭代器提高交互速度
         let output_iter = llama.generate_iter(
             input_ids,
             256,
             T::from(0.9).unwrap(),
-            4,
+            1,
             T::from(1.0).unwrap(),
             &mut cache
         );
@@ -66,6 +67,8 @@ where T:'static+Send+Sync+ Float
             print!("{}", word);
             std::io::stdout().flush().unwrap();
         }
+        let duration = start_time.elapsed();
+        println!("Time taken: {:?}", duration);
     }
 }
 
@@ -95,7 +98,7 @@ where T: 'static+Send+Sync+Float
         input_ids,
         200,
         T::from(0.8).unwrap(),
-        30,
+        1,
         T::from(1.).unwrap(),
     );
     println!("{}", tokenizer.decode(&output_ids, true).unwrap());
@@ -150,6 +153,7 @@ fn run_chat_start(){
     }
 }
 fn run_story_start(){
+    
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("chat");
     
@@ -159,12 +163,17 @@ fn run_story_start(){
     
     // 从文件读取 JSON 数据并反序列化
     let config: LlamaConfigJson = serde_json::from_reader(config_file).unwrap();
+    let start_time = Instant::now();
     match config.torch_dtype.as_str() {
         "float32" => story_start::<f32>(),
         "float16" => story_start::<f16>(),
         "bfloat16" => story_start::<bf16>(),
         _=> panic!("Unsupported dtype!"),
     }
+    let duration = start_time.elapsed();
+
+    // 打印运行时间（秒和毫秒）
+    println!("Time taken: {:?}", duration);
 }
 
 fn run_story_start_for_api(prompt:String)->String{
@@ -359,7 +368,7 @@ fn start(){
         _ => println!("Invalid mode!"),
     }
 }
-
+const NUM_DEVICE:usize=4;
 fn main() {
     start();
 }
