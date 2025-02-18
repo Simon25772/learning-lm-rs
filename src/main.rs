@@ -14,9 +14,9 @@ use tokenizers::Tokenizer;
 use actix_web::{get, web::{self, Data}, App, HttpServer, Responder};
 use actix_session::Session;
 use actix_session::CookieSession;
-
+const NUM_DEVICE:usize=4;
 fn chat_start<T>()
-where T: Float
+where T:'static+Send+Sync+ Float
 + std::ops::AddAssign
 + std::ops::Mul<Output = T>
 + std::ops::DivAssign
@@ -74,7 +74,7 @@ where T: Float
 
 
 fn story_start<T>()
-where T: Float
+where T: 'static+Send+Sync+Float
 + std::ops::AddAssign
 + std::ops::Mul<Output = T>
 + std::ops::DivAssign
@@ -102,7 +102,7 @@ where T: Float
 }
 
 fn story_start_for_api<T>(prompt:String)->String
-where T: Float
+where T: 'static+Send+Sync+Float
 + std::ops::AddAssign
 + std::ops::Mul<Output = T>
 + std::ops::DivAssign
@@ -195,7 +195,7 @@ async fn story_api(prompt: web::Path<String>) -> impl Responder {
 }
 
 fn chat_start_for_api<T>(user_id:i32, data: &web::Data<Mutex<Status<T>>>, prompt:String)->String
-where T: Float
+where T: 'static+Send+Sync+Float
 + std::ops::AddAssign
 + std::ops::Mul<Output = T>
 + std::ops::DivAssign
@@ -251,7 +251,7 @@ where T: Float
 //session_id
 static mut COUNTER:i32=0;
 async fn chat_api<T>(data: web::Data<Mutex<Status<T>>>, prompt:web::Path<String>, session: Session)->impl Responder
-where T: Float
+where T: 'static+Send+Sync+Float
 + std::ops::AddAssign
 + std::ops::Mul<Output = T>
 + std::ops::DivAssign

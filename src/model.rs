@@ -1,18 +1,20 @@
 use std::fs::File;
 use std::ops::{Add, AddAssign, DivAssign, Mul};
-use std::vec;
+use std::sync::{Arc, Mutex};
+use std::{thread, vec};
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
+use crate::NUM_DEVICE;
 use num_traits::Float;
 use rand::distributions::uniform::SampleUniform;
 use safetensors::SafeTensors;
 use serde::de;
 use std::path::Path;
-pub struct Llama<T> {
+pub struct Llama<T:'static+Send+Sync> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
     n_q_h: usize,           // number of heads for q
@@ -30,7 +32,7 @@ pub struct Llama<T> {
 
 impl<T> Llama<T> 
 where 
-    T: Float + std::ops::AddAssign + std::ops::Mul<Output = T> + std::ops::DivAssign + Copy + Add<Output = T> + Clone + Default + std::iter::Sum
+    T: 'static+Send+Sync+Float + std::ops::AddAssign + std::ops::Mul<Output = T> + std::ops::DivAssign + Copy + Add<Output = T> + Clone + Default + std::iter::Sum
 {
     pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
         let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
@@ -153,7 +155,7 @@ where
 
 impl<T> Llama<T>
 where
-    T: Float + AddAssign + Mul<Output = T> + DivAssign + Copy + Clone + Default + std::iter::Sum
+    T: 'static+Send+Sync+Float + AddAssign + Mul<Output = T> + DivAssign + Copy + Clone + Default + std::iter::Sum
 {
     pub fn generate(
         &self,
@@ -305,6 +307,104 @@ fn self_attention<T>(
 }
 
 fn mlp<T>(
+    residual: &mut Tensor<T>,
+    hidden_states: &mut Tensor<T>,
+    gate: &mut Tensor<T>,
+    up: &mut Tensor<T>,
+    w_up: &Tensor<T>,
+    w_down: &Tensor<T>,
+    w_gate: &Tensor<T>,
+    rms_w: &Tensor<T>,
+    eps: T,
+) where 
+    T: 'static + Send + Sync + Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign,
+{
+    // 获取序列长度和隐藏维度
+    let seq_len = residual.shape()[0];
+    let d = residual.shape()[1];
+    let di = gate.shape()[1] / NUM_DEVICE;
+
+    // Step 1: 对隐藏状态进行 RMS 归一化
+    rms_norm(hidden_states, residual, rms_w, eps);
+
+    // Step 2: 将权重矩阵按设备数量分割为子矩阵，便于并行处理
+    let w_ups = Arc::new(w_up.divide_by_row(NUM_DEVICE));   // 上采样权重分割
+    let w_gates = Arc::new(w_gate.divide_by_row(NUM_DEVICE)); // 门控权重分割
+    let w_downs = Arc::new(w_down.divide_by_col(NUM_DEVICE)); // 下采样权重分割
+
+    // Step 3: 创建线程句柄数组，并启动多个线程进行并行计算
+    let residual_mutex = Arc::new(Mutex::new(residual.clone())); // 使用互斥锁保护残差张量
+    let mut handles = Vec::new(); // 存储线程句柄
+
+    for i in 0..NUM_DEVICE {  
+        // 克隆必要的变量，确保每个线程拥有独立的数据副本
+        let residual_clone = Arc::clone(&residual_mutex);
+        let mut hidden_states_clone = hidden_states.clone();
+        let mut gate_buf_clone = Tensor::<T>::default(&vec![seq_len, di]); // 初始化门控缓冲区
+        let mut up_buf_clone = Tensor::<T>::default(&vec![seq_len, di]);   // 初始化上采样缓冲区
+        let w_ups_clone = Arc::clone(&w_ups);
+        let w_downs_clone = Arc::clone(&w_downs);
+        let w_gates_clone = Arc::clone(&w_gates);
+
+        // 启动线程，执行并行计算任务
+        let handle = thread::spawn(move || {
+            mlp_parallel_run(
+                residual_clone, 
+                &mut hidden_states_clone, 
+                &mut gate_buf_clone, 
+                &mut up_buf_clone, 
+                &w_ups_clone[i], 
+                &w_downs_clone[i], 
+                &w_gates_clone[i],
+            );
+        });
+
+        handles.push(handle); // 保存线程句柄
+    }
+
+    // Step 4: 等待所有线程完成计算
+    for handle in handles {
+        handle.join().unwrap(); // 确保线程安全退出
+    }
+
+    // Step 5: 更新残差张量
+    let residual_end = residual_mutex.lock().unwrap(); // 加锁获取最终残差值
+    *residual = residual_end.clone(); // 更新原始残差张量
+}
+
+fn mlp_parallel_run<T>(
+    residual: Arc<Mutex<Tensor<T>>>,
+    hidden_states: &mut Tensor<T>,
+    gate: &mut Tensor<T>,
+    up: &mut Tensor<T>,
+    w_up: &Tensor<T>,
+    w_down: &Tensor<T>,
+    w_gate: &Tensor<T>,
+) where 
+    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign,
+{
+    // Step 1: 计算门控张量和上采样张量的矩阵乘法
+    matmul_transb(gate, T::zero(), hidden_states, w_gate, T::one()); // Gate = HiddenStates × W_gate
+    matmul_transb(up, T::zero(), hidden_states, w_up, T::one());     // Up = HiddenStates × W_up
+
+    // Step 2: 应用 SwiGLU 激活函数
+    swiglu(up, gate); // SwiGLU(Up, Gate)
+
+    // Step 3: 计算下采样矩阵乘法
+    matmul_transb(hidden_states, T::zero(), up, w_down, T::one()); // HiddenStates = Up × W_down
+
+    // Step 4: 更新残差张量
+    let mut tmp = residual.lock().unwrap(); // 加锁获取残差张量
+    unsafe {
+        tmp.data_mut() // 获取残差张量的可变数据指针
+            .iter_mut() // 遍历残差张量的每个元素
+            .zip(hidden_states.data().iter()) // 与隐藏状态张量逐元素配对
+            .for_each(|(r, h)| *r += *h); // 残差连接：Residual += HiddenStates
+    }
+}
+
+
+fn mlp2<T>(
     residual: &mut Tensor<T>,
     hidden_states: &mut Tensor<T>,
     gate: &mut Tensor<T>,
