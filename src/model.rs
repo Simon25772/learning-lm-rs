@@ -2,17 +2,22 @@ use std::fs::File;
 use std::ops::{Add, AddAssign, DivAssign, Mul};
 use std::sync::{Arc, Mutex};
 use std::{thread, vec};
-
+use crate::SuperTrait;
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
-use crate::NUM_DEVICE;
+use crate::{api::Status, NUM_DEVICE};
+use actix_web::{web,Error, HttpResponse};
+use bytes::Bytes;
 use num_traits::Float;
 use rand::distributions::uniform::SampleUniform;
 use safetensors::SafeTensors;
 use serde::de;
+use futures::stream::Stream;
+use async_stream::stream;
+use tokenizers::Tokenizer;
 use std::path::Path;
 pub struct Llama<T:'static+Send+Sync> {
     vocab: usize,           // vocab size
@@ -32,7 +37,7 @@ pub struct Llama<T:'static+Send+Sync> {
 
 impl<T> Llama<T> 
 where 
-    T: 'static+Send+Sync+Float + std::ops::AddAssign + std::ops::Mul<Output = T> + std::ops::DivAssign + Copy + Add<Output = T> + Clone + Default + std::iter::Sum
+    T: SuperTrait
 {
     pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
         let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
@@ -154,7 +159,7 @@ where
 
 impl<T> Llama<T>
 where
-    T: 'static+Send+Sync+Float + AddAssign + Mul<Output = T> + DivAssign + Copy + Clone + Default + std::iter::Sum
+T: SuperTrait
 {
     pub fn generate(
         &self,
@@ -239,7 +244,53 @@ where
             Some(next_generated_token)
         })
     }
+    // 返回流式响应
+    pub fn generate_stream<'a>(
+        self,
+        token_ids: &[u32],
+        max_len: usize,
+        top_p: T,
+        top_k: u32,
+        temperature: T,
+        data: web::Data<Arc<Mutex<Status<T>>>>,
+        user_id:i32,
+        tokenizer:Tokenizer
+    ) -> HttpResponse{
+        let token_ids=token_ids.to_vec();
+        let body_stream = stream! {
+            let mut generated_token_count = 0;
+            let input_token_vec: Vec<u32> = token_ids.to_vec();
+            let mut input_tensor = Tensor::<u32>::new(input_token_vec, &vec![1, token_ids.len()]);
+            let mut next_generated_token: u32 = 0;
+            let mut data = data.lock().unwrap();
+            let mut cache = data.memory.entry(user_id).or_insert(self.new_cache());
+            while generated_token_count < max_len && next_generated_token != self.eos_token_id {
+                let probability_distribution = self.forward(&input_tensor, &mut cache);
+                next_generated_token = OP::random_sample(
+                    &probability_distribution,
+                    top_p,
+                    top_k,
+                    temperature,
+                );
+                generated_token_count += 1;
+                let word = tokenizer.decode(&vec![next_generated_token], true).unwrap();
+                let word = match word.chars().all(|c| c.is_alphabetic()) {
+                    true => format!(" {}", word),
+                    false => word,
+                };
+                input_tensor = Tensor::<u32>::new(vec![next_generated_token], &vec![1, 1]);
+                yield Ok::<_, Error>(Bytes::from(word));
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        };
+        HttpResponse::Ok()
+            .content_type("text/plain")
+            .streaming(body_stream)
+    } 
 }
+
+
+
 
 fn self_attention_parallel<T>(
     residual: &mut Tensor<T>,
@@ -314,15 +365,6 @@ fn self_attention_parallel_run<T>(
     total_seq_len: usize,
     dqkv: usize
 )where T:'static+Send+Sync+Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign + std::ops::DivAssign{
-    // 获取各张量的数据指针
-    // 打印 Tensor 参数的形状
-    // println!("Shape of residual: {:?}", residual.lock().unwrap().shape());
-    // println!("Shape of hidden_states: {:?}", hidden_states.shape());
-    // println!("Shape of att_scores: {:?}", att_scores.shape());
-    // println!("Shape of q: {:?};{:?}", q.shape(), q.len());
-    // println!("Shape of k: {:?}", k.shape());
-    // println!("Shape of v: {:?}", v.shape());
-    // println!("Shape of o: {:?}", o.shape());
    let att_scores_data = unsafe { att_scores.data_mut() };
    let q_data = q.data();
    let k_data = k.data();
