@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::File;
 use std::ops::{Add, AddAssign, DivAssign, Mul};
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,7 @@ use crate::kvcache::KVCache;
 use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
-use crate::{api::Status, NUM_DEVICE};
+use crate::{api::{Status, MySession}, NUM_DEVICE};
 use actix_web::{web,Error, HttpResponse};
 use bytes::Bytes;
 use num_traits::Float;
@@ -252,8 +253,9 @@ T: SuperTrait
         top_p: T,
         top_k: u32,
         temperature: T,
-        data: web::Data<Arc<Mutex<Status<T>>>>,
-        user_id:i32,
+        cache_data: web::Data<Arc<Mutex<Status<T>>>>,
+        session_data: web::Data<Arc<Mutex<Vec<MySession>>>>,
+        index:usize,
         tokenizer:Tokenizer
     ) -> HttpResponse{
         let token_ids=token_ids.to_vec();
@@ -262,8 +264,10 @@ T: SuperTrait
             let input_token_vec: Vec<u32> = token_ids.to_vec();
             let mut input_tensor = Tensor::<u32>::new(input_token_vec, &vec![1, token_ids.len()]);
             let mut next_generated_token: u32 = 0;
-            let mut data = data.lock().unwrap();
-            let mut cache = data.memory.entry(user_id).or_insert(self.new_cache());
+            let mut session_data = session_data.lock().unwrap();
+            let session_id = session_data[index].id.clone();
+            let mut cache_data = cache_data.lock().unwrap();
+            let mut cache = cache_data.memory.entry(session_id).or_insert(self.new_cache());
             while generated_token_count < max_len && next_generated_token != self.eos_token_id {
                 let probability_distribution = self.forward(&input_tensor, &mut cache);
                 next_generated_token = OP::random_sample(
@@ -278,6 +282,7 @@ T: SuperTrait
                     true => format!(" {}", word),
                     false => word,
                 };
+                session_data[index].history.last_mut().unwrap().content+=&word;
                 input_tensor = Tensor::<u32>::new(vec![next_generated_token], &vec![1, 1]);
                 yield Ok::<_, Error>(Bytes::from(word));
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
