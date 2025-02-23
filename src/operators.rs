@@ -496,13 +496,13 @@ fn get_module()->&'static Module{
 //         y_gpu.copy_to(y.data_mut()).unwrap();
 //     }
 // }
-
+use crate::SuperTrait;
 #[cfg(feature="gpu")]
-pub fn masked_softmax<T>(
-    y: &mut Tensor<T>,
-) where
-    T: Float + Sub + Div + Copy + Clone + Default + std::iter::Sum + std::ops::DivAssign + DeviceCopy,
-{
+pub fn masked_softmax<T:SuperTrait>(
+    y: &mut Tensor<T>  // 确保使用f32类型
+){
+    
+
     let ndim = y.shape().len();
     assert!(ndim >= 2);
     let seq_len = y.shape()[ndim - 2];
@@ -515,33 +515,35 @@ pub fn masked_softmax<T>(
     // 获取内核函数
     let kernel = module.get_function("masked_softmax_kernel").unwrap();
 
-    // 将数据复制到 GPU
-    let y_gpu = DeviceBuffer::from_slice(y.data()).unwrap();
+     // 将数据复制到 GPU
+     let y_gpu = DeviceBuffer::from_slice(y.data()).unwrap();
 
-    // 定义线程块和网格大小
-    let threads_per_block = 256; // 每个线程块处理 256 个元素
-    let blocks_per_grid = (batch as u32 + threads_per_block - 1) / threads_per_block;
+    // 计算执行配置
+    let threads_per_block:u32 = 256;
+    let num_rows = batch * seq_len;
+    let blocks_per_grid = num_rows as u32;
+    let shared_mem_bytes:u32 = 2 * threads_per_block * std::mem::size_of::<f32>() as u32;
 
     // 启动内核
     unsafe {
-        launch!(kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(
-            y_gpu.as_device_ptr(),  // 输入数据
-            y_gpu.as_device_ptr(),  // 输出数据
-            seq_len as i32,         // 序列长度
-            total_seq_len as i32,   // 总长度
-            batch as i32            // 批次大小
-        ))
-        .unwrap();
+        launch!(
+            kernel<<<blocks_per_grid, threads_per_block, shared_mem_bytes, stream>>>(
+                y_gpu.as_device_ptr(),
+                batch as i32,
+                seq_len as i32,
+                total_seq_len as i32
+            )
+        ).unwrap();
     }
-    
 
-    // 同步流以确保计算完成
+    // 同步并传回数据
     stream.synchronize().unwrap();
-
-    // 将结果从 GPU 复制回主机W
     unsafe {
-        y_gpu.copy_to(y.data_mut()).unwrap();
+        // let mut host_data = vec![T::default(); batch * dim];
+        y_gpu.copy_to(&mut y.data_mut()).unwrap();
+        // *y.data_mut() = host_data;
     }
+
 }
 
 #[cfg(feature="gpu")]

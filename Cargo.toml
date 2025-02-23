@@ -25,6 +25,6 @@ cust = { version = "0.3" }
 once_cell = "1.8"
 lazy_static = "1.5.0"
 [features]
-default = []
+default = ["gpu"]
 gpu = ["single"]
 single = []
