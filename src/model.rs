@@ -3,6 +3,7 @@ use std::fs::File;
 use std::ops::{Add, AddAssign, DivAssign, Mul};
 use std::sync::{Arc, Mutex};
 use std::{thread, vec};
+use crate::api::{Message, Role};
 use crate::SuperTrait;
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
@@ -67,7 +68,7 @@ where
     pub fn new_cache(&self) -> KVCache<T> {
         KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h * self.dqkv, 0)
     }
-
+    
     pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<T>) -> Tensor<T> {
         let seq_len = input.size();
         let past_seq_len = cache.len();
@@ -113,19 +114,23 @@ where
 
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
-            // self_attention(
-            //     &mut hidden_states,              // 存储注意力机制的输出张量
-            //     &mut att_scores,      // 存储注意力得分的张量
-            //     q,                   // Query 张量，表示查询向量
-            //     &full_k,             // Key 张量，表示键向量
-            //     &full_v,             // Value 张量，表示值向量
-            //     self.n_kv_h,         // Key 和 Value 的头数量
-            //     n_groups,            // 注意力头的分组数量
-            //     seq_len,             // 输入序列的长度
-            //     total_seq_len,       // 总序列长度（包括当前序列和缓存的过往序列）
-            //     self.dqkv,           // 单个 Query、Key 或 Value 向量的维度
-            // );
-            // matmul_transb(&mut residual, T::one(), &hidden_states, &self.params.wo[layer], T::one());
+            #[cfg(feature="single")]
+            {
+                self_attention(
+                    &mut hidden_states,              // 存储注意力机制的输出张量
+                    &mut att_scores,      // 存储注意力得分的张量
+                    q,                   // Query 张量，表示查询向量
+                    &full_k,             // Key 张量，表示键向量
+                    &full_v,             // Value 张量，表示值向量
+                    self.n_kv_h,         // Key 和 Value 的头数量
+                    n_groups,            // 注意力头的分组数量
+                    seq_len,             // 输入序列的长度
+                    total_seq_len,       // 总序列长度（包括当前序列和缓存的过往序列）
+                    self.dqkv,           // 单个 Query、Key 或 Value 向量的维度
+                );
+                matmul_transb(&mut residual, T::one(), &hidden_states, &self.params.wo[layer], T::one());
+            }
+            #[cfg(not(feature="single"))]
             self_attention_parallel(&mut residual, &mut hidden_states, &mut att_scores, q, &full_k, &full_v, &self.params.wo[layer], self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
             mlp(
                 &mut residual,                                  // residual 被传入 MLP 层处理
@@ -253,36 +258,51 @@ T: SuperTrait
         top_p: T,
         top_k: u32,
         temperature: T,
-        cache_data: web::Data<Arc<Mutex<Status<T>>>>,
-        session_data: web::Data<Arc<Mutex<Vec<MySession>>>>,
-        index:usize,
+        session:Arc<Mutex<MySession<T>>>,
         tokenizer:Tokenizer
     ) -> HttpResponse{
         let token_ids=token_ids.to_vec();
         let body_stream = stream! {
+            let mut session_data = session.lock().unwrap();
             let mut generated_token_count = 0;
             let input_token_vec: Vec<u32> = token_ids.to_vec();
+            session_data.history.last_mut().unwrap().add_count(token_ids.len());
+            session_data.history.push(Message::new_with_role(Role::AI));
             let mut input_tensor = Tensor::<u32>::new(input_token_vec, &vec![1, token_ids.len()]);
-            let mut next_generated_token: u32 = 0;
-            let mut session_data = session_data.lock().unwrap();
-            let session_id = session_data[index].id.clone();
-            let mut cache_data = cache_data.lock().unwrap();
-            let mut cache = cache_data.memory.entry(session_id).or_insert(self.new_cache());
-            while generated_token_count < max_len && next_generated_token != self.eos_token_id {
-                let probability_distribution = self.forward(&input_tensor, &mut cache);
+            let mut next_generated_token;
+            
+            while generated_token_count < max_len{
+                let mut cache;
+                let probability_distribution;
+                {
+                    cache = match session_data.cache.as_mut(){
+                        Some(cache)=>{
+                            cache
+                        },
+                        None=>{
+                            session_data.cache=Some(self.new_cache());
+                            session_data.cache.as_mut().unwrap()
+                        }
+                    };
+                    probability_distribution = self.forward(&input_tensor, &mut cache);
+                }
                 next_generated_token = OP::random_sample(
                     &probability_distribution,
                     top_p,
                     top_k,
                     temperature,
                 );
+                session_data.history.last_mut().unwrap().add_count(1);
                 generated_token_count += 1;
+                if next_generated_token == self.eos_token_id{
+                    break;
+                }
                 let word = tokenizer.decode(&vec![next_generated_token], true).unwrap();
                 let word = match word.chars().all(|c| c.is_alphabetic()) {
                     true => format!(" {}", word),
                     false => word,
                 };
-                session_data[index].history.last_mut().unwrap().content+=&word;
+                session_data.history.last_mut().unwrap().content+=&word;
                 input_tensor = Tensor::<u32>::new(vec![next_generated_token], &vec![1, 1]);
                 yield Ok::<_, Error>(Bytes::from(word));
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
@@ -293,10 +313,7 @@ T: SuperTrait
             .streaming(body_stream)
     } 
 }
-
-
-
-
+#[cfg(not(feature="single"))]
 fn self_attention_parallel<T>(
     residual: &mut Tensor<T>,
     hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)
@@ -310,7 +327,7 @@ fn self_attention_parallel<T>(
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize,
-) where T: 'static+Send+Sync+Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign + std::ops::DivAssign{
+) where T: SuperTrait{
     // 打印 Tensor 参数的形状
     // println!("Shape of residual: {:?}", residual.shape());
     // println!("Shape of hidden_states: {:?}", hidden_states.shape());
@@ -355,7 +372,7 @@ fn self_attention_parallel<T>(
     let tmp=residual_mutex.lock().unwrap();
     *residual=tmp.clone();
 }
-
+#[cfg(not(feature="single"))]
 fn self_attention_parallel_run<T>(
     residual: Arc<Mutex<Tensor<T>>>,
     hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)
@@ -369,7 +386,7 @@ fn self_attention_parallel_run<T>(
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize
-)where T:'static+Send+Sync+Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign + std::ops::DivAssign{
+)where T:SuperTrait{
    let att_scores_data = unsafe { att_scores.data_mut() };
    let q_data = q.data();
    let k_data = k.data();
@@ -433,7 +450,7 @@ fn self_attention<T>(
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize,
-) where T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign + std::ops::DivAssign{
+) where T: SuperTrait{
    // 获取各张量的数据指针
    let att_scores_data = unsafe { att_scores.data_mut() };
    let q_data = q.data();
@@ -484,7 +501,7 @@ fn self_attention<T>(
        }
    }
 }
-
+#[cfg(not(feature="single"))]
 fn mlp<T>(
     residual: &mut Tensor<T>,
     hidden_states: &mut Tensor<T>,
@@ -496,7 +513,7 @@ fn mlp<T>(
     rms_w: &Tensor<T>,
     eps: T,
 ) where 
-    T: 'static + Send + Sync + Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign,
+    T: SuperTrait,
 {
     // 获取序列长度和隐藏维度
     let seq_len = residual.shape()[0];
@@ -550,7 +567,7 @@ fn mlp<T>(
     let residual_end = residual_mutex.lock().unwrap(); // 加锁获取最终残差值
     *residual = residual_end.clone(); // 更新原始残差张量
 }
-
+#[cfg(not(feature="single"))]
 fn mlp_parallel_run<T>(
     residual: Arc<Mutex<Tensor<T>>>,
     hidden_states: &mut Tensor<T>,
@@ -560,7 +577,7 @@ fn mlp_parallel_run<T>(
     w_down: &Tensor<T>,
     w_gate: &Tensor<T>,
 ) where 
-    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign,
+    T: SuperTrait,
 {
     // Step 1: 计算门控张量和上采样张量的矩阵乘法
     matmul_transb(gate, T::zero(), hidden_states, w_gate, T::one()); // Gate = HiddenStates × W_gate
@@ -581,9 +598,8 @@ fn mlp_parallel_run<T>(
             .for_each(|(r, h)| *r += *h); // 残差连接：Residual += HiddenStates
     }
 }
-
-
-fn mlp2<T>(
+#[cfg(feature="single")]
+fn mlp<T>(
     residual: &mut Tensor<T>,
     hidden_states: &mut Tensor<T>,
     gate: &mut Tensor<T>,
@@ -593,7 +609,7 @@ fn mlp2<T>(
     w_gate: &Tensor<T>,
     rms_w: &Tensor<T>,
     eps: T,
-) where T:Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + std::iter::Sum + std::ops::AddAssign{
+) where T:SuperTrait{
     // 对 residual 进行 RMS 归一化，结果存储在 hidden_states 中
     rms_norm(hidden_states, residual, rms_w, eps);
 

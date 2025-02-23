@@ -6,14 +6,14 @@ mod params;
 mod tensor;
 mod api;
 use config::LlamaConfigJson;
+use cust::memory::DeviceCopy;
 use half::{f16, bf16};
 use num_traits::Float;
 use std::{fs::File, io::{Error, Write}, iter::Sum, ops::{AddAssign, DivAssign, Mul}, path::PathBuf, time::Instant};
 use tokenizers::Tokenizer;
 use api::start_api;
 
-// CONSTANT
-const NUM_DEVICE:usize=4;
+
 
 // SuperTrait
 pub trait SuperTrait: 'static + Send + Sync
@@ -24,7 +24,9 @@ pub trait SuperTrait: 'static + Send + Sync
     + Copy
     + Clone
     + Default
+    + DeviceCopy
     + Sum<Self>{}
+    
 
 impl<T> SuperTrait for T where 
 T:'static + Send + Sync
@@ -35,6 +37,7 @@ T:'static + Send + Sync
     + Copy
     + Clone
     + Default
+    + DeviceCopy
     + Sum<T>{}
 
 fn get_model_config(name:&str)->Result<LlamaConfigJson, Error>{
@@ -124,8 +127,8 @@ where T:SuperTrait
 fn run_chat_start(){
     match get_model_config("chat").unwrap().torch_dtype.as_str() {
         "float32" => chat_start::<f32>(),
-        "float16" => chat_start::<f16>(),
-        "bfloat16" => chat_start::<bf16>(),
+        // "float16" => chat_start::<f16>(),
+        // "bfloat16" => chat_start::<bf16>(),
         _=> panic!("Unsupported dtype!"),
     }
 }
@@ -134,8 +137,8 @@ fn run_story_start(){
     let start_time = Instant::now();
     match get_model_config("story").unwrap().torch_dtype.as_str() {
         "float32" => story_start::<f32>(),
-        "float16" => story_start::<f16>(),
-        "bfloat16" => story_start::<bf16>(),
+        // "float16" => story_start::<f16>(),
+        // "bfloat16" => story_start::<bf16>(),
         _=> panic!("Unsupported dtype!"),
     }
     let duration = start_time.elapsed();
@@ -160,6 +163,9 @@ fn start(){
         _ => println!("Invalid mode!"),
     }
 }
+
+// CONSTANT
+const NUM_DEVICE:usize=4;
 
 fn main() {
     start();

@@ -19,3 +19,12 @@ bytes = "1"
 actix-cors = "0.7.0"
 futures = "0.3.31"
 tokio = "1.43.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.3", features = ["v4"] }
+cust = { version = "0.3" }
+once_cell = "1.8"
+lazy_static = "1.5.0"
+[features]
+default = []
+gpu = ["single"]
+single = []

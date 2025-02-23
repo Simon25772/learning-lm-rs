@@ -37,6 +37,11 @@ impl<T: Default + Copy> KVCache<T> {
         self.length += seq_len;
     }
 
+    pub fn decrement(&mut self, seq_len:usize){
+        assert!(self.length >= seq_len, "KVCache length:{} but decreasing length:{}", self.length, seq_len);
+        self.length -= seq_len;
+    }
+
     pub fn len(&self) -> usize {
         self.length
     }

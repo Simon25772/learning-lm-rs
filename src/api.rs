@@ -27,55 +27,79 @@ where T:Default
     }
 }
 
+#[derive(Clone)]
 #[derive(Debug)]
 #[derive(Serialize)]
-enum Role {
+pub enum Role {
     AI,
     User,
     System
 }
 
-
+#[derive(Clone)]
 #[derive(Debug)]
 #[derive(Serialize)]
 pub struct Message{
     pub role:Role,
-    pub content:String
+    pub content:String,
+    pub token_count:usize,
 }
 
 impl Message{
-    fn new_with_role(role: Role) -> Self {
+    pub fn new_with_role(role: Role) -> Self {
         Self {
             role,
             content: "".to_string(),
+            token_count:0
         }
     }
-    fn new(role: Role, content: String) -> Self {
+    pub fn new(role: Role, content: String) -> Self {
         Self {
             role,
             content,
+            token_count:0,
         }
+    }
+    pub fn add_count(&mut self, n:usize){
+        self.token_count += n;
     }
 }
 
-#[derive(Debug)]
-#[derive(Serialize)]
-pub struct MySession{
+pub struct MySession<T>{
     pub id:String,
     pub title:String,
     pub created_at: DateTime<Utc>,
-    pub history:Vec<Message>
+    pub history:Vec<Message>,
+    pub cache:Option<KVCache<T>>
 }
 
-impl MySession{
-    fn new()->Self{
+impl<T:SuperTrait> MySession<T>{
+    pub fn new()->Self{
         Self{
             id:Uuid::new_v4().to_string(),
             title:"New Chat".to_string(),
-            created_at: DateTime::<Utc>::default(),
-            history:Vec::new()
+            created_at: Utc::now(),
+            history:Vec::new(),
+            cache:None
         }
     }
+    pub fn callback(&mut self, index:usize){
+        while self.history.len() > index{
+            if let Some(msg) = self.history.pop() {
+                if let Some(cache) = self.cache.as_mut() {
+                    cache.decrement(msg.token_count);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct MySessionData{
+    pub id:String,
+    pub title:String,
+    pub created_at: DateTime<Utc>,
+    pub history:Vec<Message>,
 }
 
 fn story_start_for_api<T>(prompt:String)->String
@@ -105,8 +129,8 @@ where T: SuperTrait
 fn run_story_start_for_api(prompt:String)->String{
     match get_model_config("story").unwrap().torch_dtype.as_str() {
         "float32" => story_start_for_api::<f32>(prompt),
-        "float16" => story_start_for_api::<f16>(prompt),
-        "bfloat16" => story_start_for_api::<bf16>(prompt),
+        // "float16" => story_start_for_api::<f16>(prompt),
+        // "bfloat16" => story_start_for_api::<bf16>(prompt),
         _=> "INNER ERROR".to_string(),
     }
 }
@@ -121,9 +145,8 @@ async fn story_api(prompt: web::Path<String>) -> impl Responder {
     run_story_start_for_api(prompt.to_string())
 }
 
-fn chat_start_for_api<T:SuperTrait>(index:usize, 
-    cache_data: web::Data<Arc<Mutex<Status<T>>>>, 
-    session_data: web::Data<Arc<Mutex<Vec<MySession>>>>, 
+fn chat_start_for_api<T:SuperTrait>(
+    session:Arc<Mutex<MySession<T>>>,
     prompt:String)->HttpResponse
 {
     // 加载引擎
@@ -147,56 +170,55 @@ fn chat_start_for_api<T:SuperTrait>(index:usize,
         T::from(0.9).unwrap(),
         4,
         T::from(1.0).unwrap(),
-        cache_data,
-        session_data,
-        index,
+        session,
         tokenizer
     )
 }
 
-async fn get_all_sessions(data: web::Data<Arc<Mutex<Vec<MySession>>>>)-> impl Responder{
+async fn get_all_sessions<T:SuperTrait>(data: web::Data<Arc<Mutex<Vec<Arc<Mutex<MySession<T>>>>>>>)-> impl Responder{
     let sessions = data.lock().unwrap();
-    HttpResponse::Ok().json(&*sessions)
+    let session_data: Vec<MySessionData> = sessions.iter()
+        .map(|session| {
+            let session = session.lock().unwrap(); // 锁住每个 session
+            MySessionData {
+                id: session.id.clone(),
+                title: session.title.clone(),
+                created_at: session.created_at.clone(),
+                history: session.history.clone(),
+            }
+        })
+        .collect();
+    HttpResponse::Ok().json(session_data)
 }
 
-async fn create_session(data: web::Data<Arc<Mutex<Vec<MySession>>>>)-> impl Responder{
-    let mut sessions = data.lock().unwrap();
-    sessions.push(MySession::new());
-    // sessions.[1].unwrap().history.last_mut().unwrap().content += "#";
-    HttpResponse::Ok().json(&*sessions)
+async fn create_session<T:SuperTrait>(data: web::Data<Arc<Mutex<Vec<Arc<Mutex<MySession<T>>>>>>>)-> impl Responder{
+    {
+        let mut sessions = data.lock().unwrap();
+        sessions.push(Arc::new(Mutex::new(MySession::new())));
+    }
+    get_all_sessions(data).await
 }
 
-//session_id
-static mut COUNTER:i32=0;
-async fn chat_api<T>(data: web::Data<Arc<Mutex<Status<T>>>>, 
-    data_session: web::Data<Arc<Mutex<Vec<MySession>>>>,
+async fn chat_api<T>(data: web::Data<Arc<Mutex<Vec<Arc<Mutex<MySession<T>>>>>>>,
     query: web::Query<HashMap<String, String>>)->HttpResponse
 where T: SuperTrait
 {   
     let session_id=query.get("id").unwrap();
     let content=query.get("content").unwrap();
-    let index={
-        let mut chat_sessions=data_session.lock().unwrap();
-        match chat_sessions.iter().position(|x| x.id==*session_id){
-            Some(index)=>{
-                chat_sessions[index].history.push(Message{role:Role::User, content:content.clone()});
-                chat_sessions[index].history.push(Message::new_with_role(Role::AI));
-                Some(index)
-            },
-            None=>None
-        } 
-    };
-    match index {
-        Some(x)=>{
-            chat_start_for_api(x, data,data_session, content.clone())
+    let chat_sessions=data.lock().unwrap();
+    match chat_sessions.iter().find(|&x|x.lock().unwrap().id==*session_id){
+        Some(item)=>{
+                {item.lock().unwrap().history.push(Message::new(Role::User, content.clone()));};
+                chat_start_for_api(Arc::clone(item), content.clone())
         },
         None=>HttpResponse::BadRequest().json("Invalid Session Id")
     }
 }
 
 async fn run_serve<T:SuperTrait>()->std::io::Result<()>{
-    let data=Arc::new(Mutex::new(Status::<T>::new()));
-    let chat_sessions=Arc::new(Mutex::new(Vec::<MySession>::new()));
+    // let data=Arc::new(Mutex::new(Status::<T>::new()));
+    // let chat_sessions=Arc::new(Mutex::new(Vec::<MySession>::new()));
+    let data=Arc::new(Mutex::new(Vec::<Arc<Mutex<MySession<T>>>>::new()));
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("http://localhost:8080") 
@@ -208,10 +230,10 @@ async fn run_serve<T:SuperTrait>()->std::io::Result<()>{
             .wrap(cors)
             .wrap(CookieSession::signed(&[0; 32]).secure(false))
             .app_data(web::Data::new(data.clone()))
-            .app_data(web::Data::new(chat_sessions.clone()))
+            // .app_data(web::Data::new(chat_sessions.clone()))
             .route("/chat", web::get().to(chat_api::<T>))
-            .route("/getAllSessions", web::get().to(get_all_sessions))
-            .route("/createSession", web::get().to(create_session))
+            .route("/getAllSessions", web::get().to(get_all_sessions::<T>))
+            .route("/createSession", web::get().to(create_session::<T>))
             .service(story_api)
             .service(story_api_without_prompt)
     })
@@ -227,8 +249,8 @@ pub async fn start_api() -> std::io::Result<()> {
     println!("Server running at http://127.0.0.1:8081");
     match get_model_config("chat").unwrap().torch_dtype.as_str() {
         "float32" => run_serve::<f32>().await,
-        "float16" => run_serve::<f16>().await,
-        "bfloat16" => run_serve::<bf16>().await,
+        // "float16" => run_serve::<f16>().await,
+        // "bfloat16" => run_serve::<bf16>().await,
         _ => panic!("Unsupported torch_dtype"),
     }
 }
