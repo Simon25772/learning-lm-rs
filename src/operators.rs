@@ -497,10 +497,13 @@ fn get_module()->&'static Module{
 //     }
 // }
 use crate::SuperTrait;
+use crate::types::F32;
 #[cfg(feature="gpu")]
 pub fn masked_softmax<T:SuperTrait>(
     y: &mut Tensor<T>  // 确保使用f32类型
 ){
+    use crate::types::F32;
+
     
 
     let ndim = y.shape().len();
@@ -516,7 +519,7 @@ pub fn masked_softmax<T:SuperTrait>(
     let kernel = module.get_function("masked_softmax_kernel").unwrap();
 
      // 将数据复制到 GPU
-     let y_gpu = DeviceBuffer::from_slice(y.data()).unwrap();
+     let y_gpu = DeviceBuffer::from_slice(y.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
 
     // 计算执行配置
     let threads_per_block:u32 = 256;
@@ -539,9 +542,10 @@ pub fn masked_softmax<T:SuperTrait>(
     // 同步并传回数据
     stream.synchronize().unwrap();
     unsafe {
-        // let mut host_data = vec![T::default(); batch * dim];
-        y_gpu.copy_to(&mut y.data_mut()).unwrap();
-        // *y.data_mut() = host_data;
+        let mut temp_f32 = vec![0.0f32; y_gpu.len()];
+        y_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32.into_iter().map(|x| <T as F32>::from_f32(x)).collect();
+        y.data_mut().copy_from_slice(&converted);
     }
 
 }
@@ -553,7 +557,7 @@ pub fn rms_norm<T>(
     w: &Tensor<T>,
     epsilon: T,
 ) where
-    T: Float + Mul<Output = T> + Add<Output = T> + Div<Output = T> + Copy + Clone + Default + std::iter::Sum + DeviceCopy,
+    T: SuperTrait
 {
     let device_id = 0; 
     let dim = x.shape()[x.shape().len() - 1];
@@ -563,9 +567,9 @@ pub fn rms_norm<T>(
     let kernel = module.get_function("rms_norm_kernel").unwrap();
 
     // 将数据复制到 GPU
-    let x_gpu = DeviceBuffer::from_slice(x.data()).unwrap();
-    let w_gpu = DeviceBuffer::from_slice(w.data()).unwrap();
-    let mut y_gpu = DeviceBuffer::from_slice(y.data()).unwrap();
+    let x_gpu = DeviceBuffer::from_slice(x.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
+    let w_gpu = DeviceBuffer::from_slice(w.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
+    let mut y_gpu = DeviceBuffer::from_slice(y.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
 
     // 定义线程块和网格大小
     let threads_per_block = 256; // 每个线程块处理 256 个元素
@@ -580,7 +584,7 @@ pub fn rms_norm<T>(
                 y_gpu.as_device_ptr(),
                 dim as i32,
                 batch as i32,
-                epsilon
+                epsilon.as_f32()
             )
         )
         .unwrap();
@@ -591,7 +595,10 @@ pub fn rms_norm<T>(
     
     // 将结果从 GPU 复制回主机
     unsafe {
-        y_gpu.copy_to(&mut y.data_mut()).unwrap();
+        let mut temp_f32 = vec![0.0f32; y_gpu.len()];
+        y_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32.into_iter().map(|x| <T as F32>::from_f32(x)).collect();
+        y.data_mut().copy_from_slice(&converted);
     }
 }
 
@@ -600,7 +607,7 @@ pub fn swiglu<T>(
     y: &mut Tensor<T>,
     x: &Tensor<T>,
 ) where
-    T: Float + Mul<Output = T> + Add<Output = T> + Neg<Output = T> + Copy + Clone + Default + DeviceCopy,
+    T: SuperTrait,
 {
     let len = y.size();
     assert_eq!(len, x.size(), "输入和输出张量的大小必须相同");
@@ -612,8 +619,8 @@ pub fn swiglu<T>(
     let kernel = module.get_function("swiglu_kernel").unwrap();
 
     // 将数据复制到 GPU
-    let x_gpu = DeviceBuffer::from_slice(x.data()).unwrap();
-    let y_gpu = DeviceBuffer::from_slice(y.data()).unwrap();
+    let x_gpu = DeviceBuffer::from_slice(x.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
+    let y_gpu = DeviceBuffer::from_slice(y.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
 
     // 定义线程块和网格大小
     let threads_per_block = 256; // 每个线程块处理 256 个元素
@@ -636,7 +643,10 @@ pub fn swiglu<T>(
 
     // 将结果从 GPU 复制回主机
     unsafe {
-        y_gpu.copy_to(y.data_mut()).unwrap();
+        let mut temp_f32 = vec![0.0f32; y_gpu.len()];
+        y_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32.into_iter().map(|x| <T as F32>::from_f32(x)).collect();
+        y.data_mut().copy_from_slice(&converted);
     }
 }
 
@@ -648,10 +658,12 @@ pub fn matmul_transb<T>(
     b: &Tensor<T>,
     alpha: T,
 ) where
-    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + DeviceCopy,
+    T: Float + Mul<Output = T> + Add<Output = T> + Copy + Clone + Default + F32,
 {
 
     // 获取矩阵维度
+
+    use crate::types::F32;
     let dim1 = a.shape()[0];
     let dim2 = b.shape()[0];
     let dim3 = a.shape()[1];
@@ -668,9 +680,10 @@ pub fn matmul_transb<T>(
     let kernel = module.get_function("matmul_transb_kernel").unwrap();
 
     // 将数据复制到 GPU
-    let a_gpu = DeviceBuffer::from_slice(a.data()).unwrap();
-    let b_gpu = DeviceBuffer::from_slice(b.data()).unwrap();
-    let c_gpu = DeviceBuffer::from_slice(c.data()).unwrap();
+    // 转换为f32数据
+    let a_gpu = DeviceBuffer::from_slice(a.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
+    let b_gpu = DeviceBuffer::from_slice(b.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
+    let c_gpu = DeviceBuffer::from_slice(c.data().iter().map(|&x|x.as_f32()).collect::<Vec<f32>>().as_slice()).unwrap();
 
     // 定义线程块和网格大小
     let threads_per_block = (16, 16); // 每个线程块处理 16x16 的子矩阵
@@ -689,8 +702,8 @@ pub fn matmul_transb<T>(
                 dim1 as i32,
                 dim2 as i32,
                 dim3 as i32,
-                alpha,
-                beta
+                alpha.as_f32(),
+                beta.as_f32()
             )
         )
         .unwrap();
@@ -699,7 +712,9 @@ pub fn matmul_transb<T>(
     // 同步流以确保计算完成
     stream.synchronize().unwrap();
     unsafe {
-        // 将结果从 GPU 复制回主机
-        c_gpu.copy_to(c.data_mut()).unwrap();
+        let mut temp_f32 = vec![0.0f32; c_gpu.len()];
+        c_gpu.copy_to(&mut temp_f32).unwrap();
+        let converted: Vec<T> = temp_f32.into_iter().map(|x| <T as F32>::from_f32(x)).collect();
+        c.data_mut().copy_from_slice(&converted);
     }
 }

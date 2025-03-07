@@ -5,6 +5,7 @@ mod operators;
 mod params;
 mod tensor;
 mod api;
+mod types;
 use config::LlamaConfigJson;
 use cust::memory::DeviceCopy;
 use half::{f16, bf16};
@@ -12,7 +13,7 @@ use num_traits::Float;
 use std::{fs::File, io::{Error, Write}, iter::Sum, ops::{AddAssign, DivAssign, Mul}, path::PathBuf, time::Instant};
 use tokenizers::Tokenizer;
 use api::start_api;
-
+use types::F32;
 
 
 // SuperTrait
@@ -24,8 +25,8 @@ pub trait SuperTrait: 'static + Send + Sync
     + Copy
     + Clone
     + Default
-    + DeviceCopy
-    + Sum<Self>{}
+    + Sum<Self>
+    + F32{}
     
 
 impl<T> SuperTrait for T where 
@@ -37,8 +38,9 @@ T:'static + Send + Sync
     + Copy
     + Clone
     + Default
-    + DeviceCopy
-    + Sum<T>{}
+    + Sum<T>
+    + F32{}
+
 
 fn get_model_config(name:&str)->Result<LlamaConfigJson, Error>{
     let project_dir = env!("CARGO_MANIFEST_DIR");
@@ -81,9 +83,9 @@ where T:SuperTrait
         let output_iter = llama.generate_iter(
             input_ids,
             256,
-            T::from(0.9).unwrap(),
+            <T as F32>::from_f32(0.9),
             1,
-            T::from(1.0).unwrap(),
+            <T as F32>::from_f32(1.0),
             &mut cache
         );
         // 使用迭代器输出
@@ -117,9 +119,9 @@ where T:SuperTrait
     let output_ids = llama.generate(
         input_ids,
         200,
-        T::from(0.8).unwrap(),
+        <T as F32>::from_f32(0.8),
         1,
-        T::from(1.).unwrap(),
+        <T as F32>::from_f32(1.),
     );
     println!("{}", tokenizer.decode(&output_ids, true).unwrap());
 }
@@ -127,8 +129,8 @@ where T:SuperTrait
 fn run_chat_start(){
     match get_model_config("chat").unwrap().torch_dtype.as_str() {
         "float32" => chat_start::<f32>(),
-        // "float16" => chat_start::<f16>(),
-        // "bfloat16" => chat_start::<bf16>(),
+        "float16" => chat_start::<f16>(),
+        "bfloat16" => chat_start::<bf16>(),
         _=> panic!("Unsupported dtype!"),
     }
 }
@@ -137,8 +139,8 @@ fn run_story_start(){
     let start_time = Instant::now();
     match get_model_config("story").unwrap().torch_dtype.as_str() {
         "float32" => story_start::<f32>(),
-        // "float16" => story_start::<f16>(),
-        // "bfloat16" => story_start::<bf16>(),
+        "float16" => story_start::<f16>(),
+        "bfloat16" => story_start::<bf16>(),
         _=> panic!("Unsupported dtype!"),
     }
     let duration = start_time.elapsed();

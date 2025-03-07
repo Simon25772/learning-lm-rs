@@ -4,6 +4,7 @@ use std::ops::{Add, AddAssign, DivAssign, Mul};
 use std::sync::{Arc, Mutex};
 use std::{thread, vec};
 use crate::api::{Message, Role};
+use crate::types::F32;
 use crate::SuperTrait;
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
@@ -92,7 +93,7 @@ where
                 &mut hidden_states,
                 &residual,
                 &self.params.rms_att_w[layer],
-                T::from(self.eps).unwrap(),
+                <T as F32>::from_f32(self.eps),
             );
 
             let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
@@ -104,12 +105,12 @@ where
             OP::rope(
                 q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
                 past_seq_len,
-                T::from(self.rope_theta).unwrap(),
+                <T as F32>::from_f32(self.rope_theta),
             );
             OP::rope(
                 k.reshape(&vec![seq_len, self.n_kv_h, self.dqkv]),
                 past_seq_len,
-                T::from(self.rope_theta).unwrap(),
+                <T as F32>::from_f32(self.rope_theta),
             );
 
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
@@ -141,7 +142,7 @@ where
                 &self.params.w_down[layer],                     // w_down 是 MLP 层的下投影矩阵
                 &self.params.w_gate[layer],                     // w_gate 是 MLP 层的门控权重
                 &self.params.rms_ffn_w[layer],                  // RMS 归一化的权重
-                T::from(self.eps).unwrap(),                                       // 归一化的 epsilon
+                <T as F32>::from_f32(self.eps),                                       // 归一化的 epsilon
             );
         }
 
@@ -153,7 +154,7 @@ where
             &mut hidden_states,
             &residual,
             &self.params.rms_out_w,
-            T::from(self.eps).unwrap(),
+            <T as F32>::from_f32(self.eps),
         );
 
         OP::matmul_transb(&mut logits, T::zero(), &hidden_states, &self.params.lm_head, T::one());
@@ -457,7 +458,7 @@ fn self_attention<T>(
    let k_data = k.data();
    let v_data = v.data();
    // 计算归一化因子，即 dqkv 的平方根
-   let norm_factor = T::from(dqkv as f32).unwrap().sqrt();
+   let norm_factor = <T as F32>::from_f32(dqkv as f32).sqrt();
    // 第一步：计算注意力分数，公式为 score = Q @ K.T / sqrt(dim)
    for head_group in 0..n_kv_h * n_groups {
        for query_pos in 0..seq_len {

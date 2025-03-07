@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use half::{f16, bf16};
 use serde::Serialize;
 use uuid::Uuid;
-use crate::kvcache::KVCache;
+use crate::{kvcache::KVCache, types::F32};
 use std::{collections::HashMap, default, fs::File, path::PathBuf, sync::{Arc, Mutex}};
 use tokenizers::Tokenizer;
 use actix_web::{get, http, web::{self}, App, HttpResponse, HttpServer, Responder};
@@ -116,9 +116,9 @@ where T: SuperTrait
     let output_ids = llama.generate(
         input_ids,
         200,
-        T::from(0.8).unwrap(),
+        <T as F32>::from_f32(0.8),
         30,
-        T::from(1.).unwrap(),
+        <T as F32>::from_f32(1.),
     );
     let mut story = prompt.clone();
     story = story + &(tokenizer.decode(&output_ids, true).unwrap());
@@ -167,9 +167,9 @@ fn chat_start_for_api<T:SuperTrait>(
     llama.generate_stream(
         input_ids,
         128,
-        T::from(0.9).unwrap(),
+        <T as F32>::from_f32(0.9),
         4,
-        T::from(1.0).unwrap(),
+        <T as F32>::from_f32(1.0),
         session,
         tokenizer
     )
@@ -242,15 +242,13 @@ async fn run_serve<T:SuperTrait>()->std::io::Result<()>{
     .await
 }
 
-
-
 #[actix_web::main]
 pub async fn start_api() -> std::io::Result<()> {
     println!("Server running at http://127.0.0.1:8081");
     match get_model_config("chat").unwrap().torch_dtype.as_str() {
         "float32" => run_serve::<f32>().await,
-        // "float16" => run_serve::<f16>().await,
-        // "bfloat16" => run_serve::<bf16>().await,
+        "float16" => run_serve::<f16>().await,
+        "bfloat16" => run_serve::<bf16>().await,
         _ => panic!("Unsupported torch_dtype"),
     }
 }
