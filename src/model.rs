@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::ops::{Add, AddAssign, DivAssign, Mul};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::{thread, vec};
 use crate::api::{Message, Role};
@@ -12,8 +13,10 @@ use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use crate::{api::{Status, MySession}, NUM_DEVICE};
-use actix_web::{web,Error, HttpResponse};
+use actix_web::HttpResponse;
 use bytes::Bytes;
+use dashmap::DashMap;
+use futures::TryStreamExt;
 use num_traits::Float;
 use rand::distributions::uniform::SampleUniform;
 use safetensors::SafeTensors;
@@ -163,7 +166,6 @@ where
     }
 }
 
-
 impl<T> Llama<T>
 where
 T: SuperTrait
@@ -252,6 +254,8 @@ T: SuperTrait
         })
     }
     // 返回流式响应
+    // 专门为web api服务
+    
     pub fn generate_stream<'a>(
         self,
         token_ids: &[u32],
@@ -259,12 +263,13 @@ T: SuperTrait
         top_p: T,
         top_k: u32,
         temperature: T,
-        session:Arc<Mutex<MySession<T>>>,
+        id:String,
+        data:Arc<DashMap<String,MySession<T>>>,
         tokenizer:Tokenizer
-    ) -> HttpResponse{
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>{
         let token_ids=token_ids.to_vec();
         let body_stream = stream! {
-            let mut session_data = session.lock().unwrap();
+            let mut session_data = data.get_mut(&id).unwrap();
             let mut generated_token_count = 0;
             let input_token_vec: Vec<u32> = token_ids.to_vec();
             session_data.history.last_mut().unwrap().add_count(token_ids.len());
@@ -305,13 +310,16 @@ T: SuperTrait
                 };
                 session_data.history.last_mut().unwrap().content+=&word;
                 input_tensor = Tensor::<u32>::new(vec![next_generated_token], &vec![1, 1]);
-                yield Ok::<_, Error>(Bytes::from(word));
+                yield Ok::<_, std::io::Error>(Bytes::from(word));
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             }
         };
-        HttpResponse::Ok()
-            .content_type("text/plain")
-            .streaming(body_stream)
+        // Pin the stream to match the return type
+        Box::pin(body_stream)
+        // Box::pin(body_stream.map_err(|e: actix_web::Error| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+        // HttpResponse::Ok()
+        //     .content_type("text/plain")
+        //     .streaming(body_stream)
     } 
 }
 #[cfg(not(feature="single"))]

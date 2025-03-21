@@ -1,10 +1,14 @@
 use actix_cors::Cors;
+use async_stream::stream;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::{stream, Stream, StreamExt};
 use half::{f16, bf16};
 use serde::Serialize;
+use tokio::time::sleep;
 use uuid::Uuid;
 use crate::{kvcache::KVCache, types::F32};
-use std::{collections::HashMap, default, fs::File, path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::HashMap, default, fs::File, path::PathBuf, pin::Pin, sync::{mpsc, Arc, Mutex}, thread, time::Duration};
 use tokenizers::Tokenizer;
 use actix_web::{get, http, web::{self}, App, HttpResponse, HttpServer, Responder};
 use actix_session::CookieSession;
@@ -18,7 +22,7 @@ where T:Default{
 }
 
 impl<T> Status<T>
-where T:Default
+where T:Default 
 {
     pub fn new()->Self{
         Self{
@@ -146,9 +150,10 @@ async fn story_api(prompt: web::Path<String>) -> impl Responder {
 }
 
 fn chat_start_for_api<T:SuperTrait>(
-    session:Arc<Mutex<MySession<T>>>,
-    prompt:String)->HttpResponse
+    id:String,
+    data:Arc<DashMap<String,MySession<T>>>)->Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>
 {
+    let prompt=data.get(&id).unwrap().history.last().unwrap().content.clone();
     // 加载引擎
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("chat");
@@ -170,55 +175,114 @@ fn chat_start_for_api<T:SuperTrait>(
         <T as F32>::from_f32(0.9),
         4,
         <T as F32>::from_f32(1.0),
-        session,
+        id,
+        data,
         tokenizer
     )
 }
 
-async fn get_all_sessions<T:SuperTrait>(data: web::Data<Arc<Mutex<Vec<Arc<Mutex<MySession<T>>>>>>>)-> impl Responder{
-    let sessions = data.lock().unwrap();
-    let session_data: Vec<MySessionData> = sessions.iter()
-        .map(|session| {
-            let session = session.lock().unwrap(); // 锁住每个 session
-            MySessionData {
-                id: session.id.clone(),
-                title: session.title.clone(),
-                created_at: session.created_at.clone(),
-                history: session.history.clone(),
-            }
-        })
-        .collect();
+async fn get_all_sessions<T:SuperTrait>(data: web::Data<Arc<DashMap<String,MySession<T>>>>)-> impl Responder{
+    let session_data:Vec<MySessionData>=data.iter().map(|entry| {
+        let session = entry.value();
+    MySessionData{
+        id: session.id.clone(),
+        title: session.title.clone(),
+        created_at: session.created_at.clone(),
+        history: session.history.clone(),
+    }}).collect();
     HttpResponse::Ok().json(session_data)
 }
 
-async fn create_session<T:SuperTrait>(data: web::Data<Arc<Mutex<Vec<Arc<Mutex<MySession<T>>>>>>>)-> impl Responder{
-    {
-        let mut sessions = data.lock().unwrap();
-        sessions.push(Arc::new(Mutex::new(MySession::new())));
-    }
+async fn create_session<T:SuperTrait>(data: web::Data<Arc<DashMap<String,MySession<T>>>>)-> impl Responder{
+    let new_session=MySession::new();
+    data.insert(new_session.id.clone(), new_session);
     get_all_sessions(data).await
 }
-
-async fn chat_api<T>(data: web::Data<Arc<Mutex<Vec<Arc<Mutex<MySession<T>>>>>>>,
+use actix_web::error::Error;
+async fn chat_api<T>(data:web::Data<Arc<DashMap<String,MySession<T>>>>,
+    tx_factory: web::Data<mpsc::Sender<FactoryMessage>>,
     query: web::Query<HashMap<String, String>>)->HttpResponse
 where T: SuperTrait
 {   
     let session_id=query.get("id").unwrap();
     let content=query.get("content").unwrap();
-    let chat_sessions=data.lock().unwrap();
-    match chat_sessions.iter().find(|&x|x.lock().unwrap().id==*session_id){
-        Some(item)=>{
-                {item.lock().unwrap().history.push(Message::new(Role::User, content.clone()));};
-                chat_start_for_api(Arc::clone(item), content.clone())
-        },
-        None=>HttpResponse::BadRequest().json("Invalid Session Id")
+    let flag;
+    {
+        let checkr=data.get(session_id);
+        match checkr {
+            Some(_)=>flag=true,
+            None=>flag=false
+        };
+    }
+    if flag==true{
+        data.get_mut(session_id).unwrap().value_mut().history.push(Message::new(Role::User, content.clone()));
+        let (tx_response, rx_response) = mpsc::channel();
+            tx_factory
+                .send(FactoryMessage::Request(session_id.clone(), tx_response))
+                .unwrap();
+            let res=rx_response.recv().unwrap();
+            // let stream=stream!{
+            //     for stg in rx_response{
+            //         yield Ok::<_, Error>(Bytes::from(stg));
+            //         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            //     }
+            // };
+            match res {
+                FactoryMessage::Response(strm)=>{
+                    HttpResponse::Ok()
+                    .content_type("text/plain")
+                    .streaming(strm)
+                },FactoryMessage::Request(_a,_b )=>panic!("Impossible!")
+            }
+    }   
+    else{
+        HttpResponse::BadRequest().json("Invalid Session Id")
+    }
+}
+
+use crate::types::FactoryMessage;
+use dashmap::{mapref::entry, DashMap};
+// Factory 线程
+fn factory_thread<T:SuperTrait>(rx: mpsc::Receiver<FactoryMessage>, map:Arc<DashMap<String, MySession<T>>>) {
+    // 处理 HTTP 请求
+    for message in rx {
+        match message {
+            FactoryMessage::Request(id, sender) => {
+                println!("Received Request with String: {}", id);
+                let str=chat_start_for_api(id, map.clone());
+                // 发送响应回消费者
+                sender.send(FactoryMessage::Response(str)).unwrap();
+                // // 模拟返回一个流式响应
+                // let data = vec![
+                //     b"Hello, \n".to_vec(),
+                //     b"this is \n".to_vec(),
+                //     b"a streaming response.\n".to_vec(),
+                // ];
+                
+                // let str = Box::pin(stream::iter(data.into_iter().map(|chunk| async move {
+                //     sleep(Duration::from_secs(1)).await;
+                //     Ok(Bytes::from(chunk))
+                // })).buffer_unordered(1));
+
+                
+            },
+            FactoryMessage::Response(_tx)=>panic!("Impossible!")
+        }
     }
 }
 
 async fn run_serve<T:SuperTrait>()->std::io::Result<()>{
+    // 添加cuda推理线程
+    let (tx_factory, rx_factory) = mpsc::channel();
+    let map:Arc<DashMap<String, MySession<T>>> = Arc::new(DashMap::new());
+    let map_clone=Arc::clone(&map);
+    thread::spawn(move || {
+        factory_thread(rx_factory,map_clone);
+    });
     // let data=Arc::new(Mutex::new(Status::<T>::new()));
     // let chat_sessions=Arc::new(Mutex::new(Vec::<MySession>::new()));
-    let data=Arc::new(Mutex::new(Vec::<Arc<Mutex<MySession<T>>>>::new()));
+    // let data=Arc::new(Mutex::new(Vec::<Arc<Mutex<MySession<T>>>>::new()));
+    let map_clone=Arc::clone(&map);
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("http://localhost:8080") 
@@ -229,8 +293,8 @@ async fn run_serve<T:SuperTrait>()->std::io::Result<()>{
         App::new()
             .wrap(cors)
             .wrap(CookieSession::signed(&[0; 32]).secure(false))
-            .app_data(web::Data::new(data.clone()))
-            // .app_data(web::Data::new(chat_sessions.clone()))
+            .app_data(web::Data::new(map_clone.clone()))
+            .app_data(web::Data::new(tx_factory.clone()))
             .route("/chat", web::get().to(chat_api::<T>))
             .route("/getAllSessions", web::get().to(get_all_sessions::<T>))
             .route("/createSession", web::get().to(create_session::<T>))

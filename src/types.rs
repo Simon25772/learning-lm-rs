@@ -27,3 +27,11 @@ impl F32 for bf16{
         self.to_f32()
     }
 }
+use std::sync::mpsc;
+use bytes::Bytes;
+use futures::stream::Stream;
+use std::pin::Pin;
+pub enum FactoryMessage {
+    Request(String, mpsc::Sender<FactoryMessage>), // HTTP 请求 (id, 返回流的 Sender)
+    Response(Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>)
+}
